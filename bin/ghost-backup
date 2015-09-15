@@ -1,0 +1,224 @@
+#!/usr/bin/env ruby
+
+# Copyright (c) Min RK.
+# Distributed under the terms of the Modified BSD License.
+
+require 'date'
+require 'json'
+require 'yaml'
+
+# gems
+require 'rest-client'
+require 'commander/import'
+require 'highline/import'
+
+program :version, '0.0.1'
+program :description, 'Backup ghost blog data'
+
+class GhostBackup
+  CONFIG_KEYS = [
+    'username',
+    'backup_dir',
+    'ghost_dir',
+    'refresh_token',
+    'base_url',
+  ]
+  
+  API_VERSION = 'v0.1'
+  
+  def initialize(config_file: "ghost-backup.yml")
+    @dirty = false
+    if config_file.nil?
+      @config_file = "ghost-backup.yml"
+    else
+      @config_file = config_file
+    end
+    @username = nil
+    # backup_dir is passed to strftime
+    @backup_dir = 'ghost-backup/%Y-%m-%d-%H%M%S'
+    @ghost_dir = "/var/www/ghost"
+    @base_url = 'https://localhost'
+    @refresh_token = nil
+    load_config
+    unless @base_url.include? '://'
+      @base_url = 'https://' + @base_url
+    end
+  end
+  
+  attr_accessor :config_file
+  
+  # gen config as a hash
+  def cfg
+    Hash[
+      CONFIG_KEYS.map { |key|
+        [key, self.instance_variable_get("@#{key}")]
+      }
+    ]
+  end
+  
+  # load yaml config file
+  def load_config
+    if not File.exists? @config_file
+      @dirty = true
+      return
+    end
+    d = YAML.load_file @config_file
+    if not d
+      return
+    end
+    if not d.instance_of? Hash
+      throw Error("Bad config: #{config_file}")
+    end
+    d.each_pair do |key, value|
+      self.instance_variable_set("@#{key}", value)
+    end
+  end
+  
+  # save yaml config file, if there have been changes
+  def save_config
+    return unless @dirty
+    puts "Writing config to #{@config_file}"
+    File.open(@config_file, 'w') do |f|
+      f.write(YAML.dump(cfg))
+    end
+    @dirty = false
+  end
+  
+  # the base API url
+  def api_url
+    "#{@base_url}/ghost/api/#{API_VERSION}"
+  end
+  
+  # the url for getting a new token
+  def token_url
+    "#{api_url}/authentication/token"
+  end
+  
+  # the url for downloading the database as JSON
+  def db_url
+    "#{api_url}/db/"
+  end
+  
+  # generate a new token with username/password via API request
+  def new_token(username, password)
+    reply = JSON.parse RestClient.post token_url, {
+      :grant_type => 'password',
+      :username => username,
+      :password => password,
+      :client_id => 'ghost-admin',
+    }
+    @refresh_token = reply['refresh_token']
+    @access_token = reply['access_token']
+    @dirty = true
+  end
+  
+  # refresh authorization token
+  def refresh
+    reply = JSON.parse RestClient.post token_url, {
+      :grant_type => 'refresh_token',
+      :refresh_token => @refresh_token,
+      :client_id => 'ghost-admin',
+    }
+    @access_token = reply['access_token']
+  end
+  
+  # ensure we are logged in
+  # refreshes token if we are,
+  # prompts for user/password if we are not
+  def authorize
+    if @refresh_token
+      begin
+        refresh
+      rescue RestClient::Exception
+        STDERR.puts "refresh token expired"
+        @refresh_token = nil
+      end
+    end
+    
+    if @refresh_token.nil?
+      puts "Need username, password to generate new token (only used once, not stored)."
+      username = @username = ask("Username: ") do |q|
+        q.default = @username
+        q.validate = /\S+/
+      end
+      password = ask("Password (not stored): ") { |q| q.echo = '*' }
+      new_token(username, password)
+      puts "Login success!"
+    end
+  end
+  
+  # backup methods
+  
+  # download the JSON dump of the database
+  def download_db
+    puts "Downloading ghost database #{db_url}"
+    if @access_token.nil?
+      authorize
+    end
+    RestClient.get db_url, {:params => {:access_token => @access_token}}
+  end
+  
+  # run a real backup
+  def backup
+    now = DateTime.now
+    dest_root = now.strftime(@backup_dir)
+    puts "Backing up '#{@base_url}' to '#{dest_root}'"
+    FileUtils.mkdir_p(dest_root)
+    if File.exists? @ghost_dir
+      from = File.join(@ghost_dir, 'content')
+      to = File.join(dest_root, 'content')
+      puts "Copying #{from} → #{to}"
+      FileUtils.cp_r(from, to)
+    else
+      STDERR.puts "Ghost directory '#{@ghost_dir}' doesn't exist, not backing up assets."
+    end
+    db_dest = File.join(dest_root, "ghost-db.json")
+    db = download_db
+    puts "Backing up database to '#{db_dest}'"
+    File.open(db_dest, 'w') { |f| f.write(db) }
+  end
+end
+
+global_option('-f', '--config-file CONFIG_FILE', 'Specify config file to use')
+
+
+command :login do |c|
+  c.syntax = 'ghost-backup login'
+  c.summary = 'Login to the ghost server'
+  c.description = 'Login to the ghost server and generate an auth token.
+  On first run, requires a username and password,
+  and records the refresh token in the config file.
+  Must be run at least once a week to keep the token active
+  and avoid re-entering username and password.'
+  c.action do |args, options|
+    gb = GhostBackup.new(:config_file => options.config_file)
+    puts "Logging in to #{gb.token_url}"
+    gb.authorize
+    gb.save_config
+  end
+end
+
+
+command :backup do |c|
+  c.syntax = 'ghost-backup backup'
+  c.summary = 'backup a ghost blog instance'
+  c.description = 'Downloads the post database and, if available, copies the local assets directory.'
+  c.action do |args, options|
+    gb = GhostBackup.new(:config_file => options.config_file)
+    gb.backup
+    gb.save_config
+  end
+end
+
+
+command :config do |c|
+  c.syntax = 'ghost-backup config'
+  c.summary = 'Generate default ghost-backup.yml'
+  c.description = 'Generate default ghost-backup.yml. Edit this file to configure the backup.'
+  c.action do |args, options|
+    gb = GhostBackup.new(:config_file => options.config_file)
+    gb.save_config
+  end
+end
+
+default_command :backup
